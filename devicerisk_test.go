@@ -2,8 +2,10 @@ package devicerisk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -218,5 +220,153 @@ func TestNewReadsTheEnvironment(t *testing.T) {
 func TestTheWebhookEventNames(t *testing.T) {
 	if EventDeviceRiskSignal != "DEVICE_RISK_SIGNAL" || EventDeviceRiskAlert != "DEVICE_RISK_ALERT" {
 		t.Fatal("webhook event names")
+	}
+}
+
+func TestTheVisitorMarkIsTheMarkApplied(t *testing.T) {
+	api := startFakeAPI(t)
+	dr := api.client(t)
+	ctx := context.Background()
+	id := "dre_" + strings.Repeat("a", 22)
+	flagged := "dre_flagged" + strings.Repeat("a", 15)
+	visitor := func(requestID string) map[string]interface{} {
+		t.Helper()
+		r, err := dr.Check(ctx, CheckOptions{RequestID: requestID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Visitor
+	}
+	v := visitor(id)
+	if mark, has := v["mark"]; !has || mark != nil || v["status"] != "none" {
+		t.Fatalf("no mark: %v", v)
+	}
+	api.opts(map[string]interface{}{"deviceMark": "trusted"})
+	if v = visitor(id); v["status"] != "trusted" || v["mark"] != "trusted" || v["matchedBy"] != "key" {
+		t.Fatalf("trusted by key: %v", v)
+	}
+	if v = visitor(flagged); v["status"] != "trusted" || v["mark"] != nil || v["matchedBy"] != "traits" {
+		t.Fatalf("never by traits: %v", v)
+	}
+	ev, err := dr.GetEvent(ctx, id)
+	if err != nil || ev["visitor"].(map[string]interface{})["mark"] != "trusted" {
+		t.Fatalf("event: %v %v", ev, err)
+	}
+	api.opts(map[string]interface{}{"deviceMark": "step_up"})
+	if v = visitor(flagged); v["status"] != "step_up" || v["mark"] != "step_up" {
+		t.Fatalf("step_up always: %v", v)
+	}
+}
+
+func TestAnUnknownVisitorMarkReadsAsNil(t *testing.T) {
+	raw := map[string]interface{}{"status": "trusted", "mark": "admin"}
+	got := ParseCheck(map[string]interface{}{"report": "ok", "visitor": raw}).Visitor
+	if mark, has := got["mark"]; !has || mark != nil || raw["mark"] != "admin" {
+		t.Fatalf("unknown mark: %v (answer %v)", got, raw)
+	}
+	if _, has := ParseCheck(map[string]interface{}{"visitor": map[string]interface{}{"status": "none"}}).Visitor["mark"]; has {
+		t.Fatal("an older answer has no mark")
+	}
+	if ParseCheck(map[string]interface{}{"visitor": "x"}).Visitor != nil {
+		t.Fatal("a visitor that is not an object reads as nil")
+	}
+}
+
+// Network kind and the AI agents' tools (newer servers): the fields come through as the API sent
+// them, and SearchEvents sends networkKind and shared as the API takes them.
+
+const networkKindCheckAnswer = `{"report":"ok","requestId":"dre_aaaaaaaaaaaaaaaaaaaaaa","visitorId":"tqv_fakeVisitor00000001",
+	"confidence":0.99,"signals":[],"stepUp":false,"wouldStepUp":false,"requires":"none","mode":"shadow",
+	"network":{"countryCode":"TR","region":null,"city":null,"accuracyKm":null,"timeZone":"Europe/Istanbul","asn":64500,
+		"asnOrg":"Example University","type":"isp","proxy":false,"tor":false,"hosting":false,"hostingProvider":null,
+		"timezoneMismatch":false,"kind":"education","kindSource":"network","vpn":false,"shared":true,
+		"sharedVisitors24h":10,"sharedAccounts24h":5,"lookAlikeMatching":false},
+	"bot":{"result":"detected","reasons":["tool_claude_agent","agent_pace","cdp","cdp_input","input_no_focus","insert_text_bulk","scripted_click"],
+		"type":"ai_agent","tools":["claude_agent"],"agent":null,"input":["agent_pace"]}}`
+
+func TestNetworkKindAndTheAIAgentsComeThroughAsTheAPISentThem(t *testing.T) {
+	dr, calls := fakeBotCheckAPI(t, 200, nil, networkKindCheckAnswer)
+	r, err := dr.Check(context.Background(), CheckOptions{RequestID: "dre_aaaaaaaaaaaaaaaaaaaaaa", ExternalUsername: "ada@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c := oneCall(t, calls); c.method != "POST" || c.path != "/device-risk/check" {
+		t.Fatalf("call: %s %s", c.method, c.path)
+	}
+	var want struct {
+		Network map[string]interface{} `json:"network"`
+		Bot     map[string]interface{} `json:"bot"`
+	}
+	if err := json.Unmarshal([]byte(networkKindCheckAnswer), &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(r.Network, want.Network) || !reflect.DeepEqual(r.Bot, want.Bot) {
+		t.Fatalf("network, bot: %#v %#v", r.Network, r.Bot)
+	}
+	// Read as the README shows.
+	kind, _ := r.Network["kind"].(string)
+	atLeast, _ := r.Network["sharedVisitors24h"].(float64)
+	lookAlike, decided := r.Network["lookAlikeMatching"].(bool)
+	if kind != "education" || !contains(NetworkKinds, kind) || r.Network["kindSource"] != "network" || r.Network["vpn"] != false ||
+		r.Network["shared"] != true || atLeast != 10 || r.Network["sharedAccounts24h"] != 5.0 || !decided || lookAlike || r.Network["proxy"] != false {
+		t.Fatalf("network kind: %#v", r.Network)
+	}
+	if !reflect.DeepEqual(r.Bot["tools"], []interface{}{"claude_agent"}) || r.Bot["type"] != "ai_agent" {
+		t.Fatalf("bot: %#v", r.Bot)
+	}
+	// An older server sends no kind; a newer one sends nil for an identification from before it.
+	for _, network := range []map[string]interface{}{
+		{"type": "relay", "tor": false, "hosting": false},
+		{"type": "relay", "proxy": false, "kind": nil, "kindSource": nil, "vpn": nil, "shared": nil, "sharedVisitors24h": nil,
+			"sharedAccounts24h": nil, "lookAlikeMatching": nil},
+	} {
+		r := ParseCheck(map[string]interface{}{"report": "ok", "network": network})
+		kind, _ := r.Network["kind"].(string)
+		_, counted := r.Network["shared"].(bool)
+		if kind != "" || counted || !reflect.DeepEqual(r.Network, network) {
+			t.Fatalf("no kind: %#v", r.Network)
+		}
+	}
+	if len(NetworkKinds) != 11 || NetworkKinds[0] != "residential" || NetworkKinds[10] != "unknown" || !contains(NetworkKinds, "relay") {
+		t.Fatalf("NetworkKinds: %v", NetworkKinds)
+	}
+}
+
+func TestSearchEventsSendsNetworkKindAndShared(t *testing.T) {
+	api := startFakeAPI(t)
+	dr := api.client(t)
+	yes, no := true, false
+	for _, c := range []struct {
+		opts SearchOptions
+		want map[string]interface{}
+	}{
+		{SearchOptions{NetworkKind: "education", Shared: &yes}, map[string]interface{}{"networkKind": "education", "shared": "true"}},
+		{SearchOptions{NetworkKind: "vpn", Shared: &no, Account: "ada@example.com"},
+			map[string]interface{}{"networkKind": "vpn", "shared": "false", "account": "ada@example.com"}},
+		{SearchOptions{Account: "ada@example.com"}, map[string]interface{}{"account": "ada@example.com"}},
+	} {
+		if _, err := dr.SearchEvents(context.Background(), c.opts); err != nil {
+			t.Fatal(err)
+		}
+		if q := api.lastDeviceRiskSearch(); !reflect.DeepEqual(q, c.want) {
+			t.Fatalf("%+v: query %v", c.opts, q)
+		}
+	}
+}
+
+func TestSearchEventsSendsANewerNetworkKindAsItIs(t *testing.T) {
+	dr, calls := fakeBotCheckAPI(t, 200, nil,
+		`{"events":[{"requestId":"dre_fakeEvent00000000001","network":{"kind":"satellite","kindSource":"network","shared":false}}],"nextCursor":null}`)
+	no := false
+	page, err := dr.SearchEvents(context.Background(), SearchOptions{NetworkKind: "satellite", Shared: &no})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := oneCall(t, calls)
+	if c.method != "GET" || c.path != "/device-risk/events?networkKind=satellite&shared=false" || c.header.Get("x-signature") != signatureOf(c) {
+		t.Fatalf("call: %s %s", c.method, c.path)
+	}
+	if network, _ := page.Events[0]["network"].(map[string]interface{}); network["kind"] != "satellite" || network["shared"] != false {
+		t.Fatalf("a newer kind comes through: %v", page.Events)
 	}
 }

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is this package's version, sent in the User-Agent.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // httpClient signs every partner API call with HMAC-SHA256 over
 // "METHOD:pathWithQuery:timestamp:nonce:sha256(body)", as the main Touchque SDK does.

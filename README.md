@@ -2,7 +2,8 @@
 
 The official Go server SDK for **Touchque Device Risk**: a visitor ID for every browser on your
 sign-up, password-reset, sign-in or approval page, a risk verdict for the account it is used for, and
-the abuse your server sees (card testing, failed sign-ins, probing, SMS pumping, code guessing).
+the abuse your server sees (card testing, failed sign-ins, probing, SMS pumping, code guessing), and which
+bot sent a request your page's tag never saw.
 
 Device Risk is a paid add-on: it answers 409 `device_risk_off` until your workspace turns it on in the
 [Touchque dashboard](https://dashboard.touchque.com).
@@ -61,6 +62,16 @@ if err == nil && r.StepUp {
   (low, medium, high, critical), `WouldDo` (allow, number_match, passkey, block) and `Reasons`
   (`Code`, `Points`, `By`: server, site, page or brand, `Text`).
 - `AccountDevice`: did this account use the device before? `Status` known, likely, new or first.
+- `Network` is the address as the risk engine saw it, with the kind of network (see [The network](#the-network)).
+- `Bot` is one answer to "a bot?" (`result`, `reasons`, `type`, `tools`, `agent`, `input`), a map as the API
+  sent it. `tools` names the automation tools (`selenium`, `playwright`, `puppeteer`, `phantomjs`,
+  `nightmare`, `headless_chrome`) and the AI agents whose marks were on the page: `claude_agent` (the Claude
+  app's browser or Claude in Chrome), `comet_agent` (Perplexity Comet), `genspark_agent`, `browser_use`,
+  `stagehand` and `skyvern`; each is `tool_<name>` in `reasons`. Other reasons include `cdp` (the DevTools
+  protocol attached), `cdp_input` (a press with no pressure), `input_no_focus` (a click or key into a page
+  that was not in front), `insert_text_bulk` (text with no key pressed), `scripted_click` (a form sent with
+  no click or key), `headless_window` and `emulator`. New tools and reasons may be added in minor versions;
+  older servers send fewer.
 
 For a sign-in approved on the phone with the main Touchque SDK, pass the same field as
 `DeviceRiskRequestID` in its `LoginRequestOptions` or `RiskCheckOptions` instead.
@@ -78,16 +89,49 @@ for {
 	if err != nil {
 		break
 	}
-	for _, e := range page.Events { /* requestId, at, visitorId, kind, matchedBy, signals, suspect… */ }
+	for _, e := range page.Events { /* requestId, at, visitorId, kind, network, matchedBy, signals, suspect… */ }
 	if cursor = page.NextCursor; cursor == "" {
 		break
 	}
 }
 ```
 
-Filters: `From`, `To` (7 days by default, at most 90), `Signal`, `StepUp`, `Kind`, `Origin`, `IP` (an
-address or a CIDR range, never returned), `Account`, `VisitorID`, `RequestID`, `Limit` (1 to 100) and the
-opaque `Cursor`. A search that would read too much is a 422 `search_too_broad`.
+Filters: `From`, `To` (7 days by default, at most 90), `Signal`, `StepUp`, `Kind` (the page), `Origin`,
+`IP` (an address or a CIDR range, never returned), `Account`, `VisitorID`, `RequestID`, `NetworkKind` and
+`Shared` (see [The network](#the-network)), `Limit` (1 to 100) and the opaque `Cursor`. A search that would
+read too much is a 422 `search_too_broad`.
+
+## The network
+
+`Network` (in `Check`, `GetEvent` and each `SearchEvents` row) is the address as the risk engine saw it,
+never coordinates, as a map: `countryCode`, `city`, `asn`, `asnOrg`, `type` (`isp`, `hosting`, `tor`,
+`relay` for Apple's iCloud Private Relay, `unknown`), `proxy` and more. Newer servers also say what kind of
+network it is (absent on older ones, nil for an identification from before it). `kind` is one of
+`devicerisk.NetworkKinds` (`residential`, `mobile_carrier`, `education`, `business`, `public_wifi`,
+`hosting`, `proxy`, `vpn`, `tor`, `relay`, `unknown`): an open list, new values may be added in minor
+versions, so keep a default branch. `kindSource` says where it came from. `vpn` is a VPN company's own
+address (the suspect score's `network_vpn`, 10 points). `shared` means many browsers used the
+identification's own address on your pages in 24 hours (a school, an office, a café or a mobile operator;
+context only), with `sharedVisitors24h` and `sharedAccounts24h` as "at least" counts (1, 2, 5, 10, 100 or
+1000). `lookAlikeMatching` is false when this computer was recognised only by its own key, cookie or stored
+id, never because it looks like another one, and nil when not decided (phones, tablets and Safari are never
+matched by look-alike). The shared fields and `lookAlikeMatching` are nil when not counted, or when
+`ClientIP` was another address than the one the browser identified from. `proxy` means the address was
+reported as a proxy in the last 30 days: context that counts little (absent on older servers). In
+`SearchEvents`, `NetworkKind` matches only identifications classified since network kind exists (older ones
+have no kind), and `Shared` set to false matches only the ones counted and not shared (one that was not
+counted matches neither). Older servers ignore both filters.
+
+Touchque uses the IP2Proxy LITE database for [proxy and VPN detection](https://www.ip2location.com).
+This site or product includes IP2Proxy LITE data available from https://lite.ip2location.com.
+
+```go
+kind, _ := r.Network["kind"].(string)                  // "" from an older server or identification
+atLeast, _ := r.Network["sharedVisitors24h"].(float64) // JSON numbers are float64
+
+shared := true
+page, err := dr.SearchEvents(ctx, devicerisk.SearchOptions{NetworkKind: "education", Shared: &shared})
+```
 
 ## Report what your server saw
 
@@ -115,6 +159,53 @@ if err == nil && slices.Contains(a.Signals, "abuse_card_testing") {
 - A card is its BIN (6 to 8 digits) and last 4 digits only; anything else is a `*ConfigError` before
   anything is sent.
 
+## Bot check
+
+Many bots never run your page, so the tag never sees them: ChatGPT-User, GPTBot, Meta's crawlers, curl,
+scripts. `BotCheck` sends one request's IP and headers from your server and answers which bot it is,
+whether that name is proven, and what Touchque would do. Touchque decides on its own servers, with no
+third-party service at request time, and keeps nothing but short-lived counters.
+
+```go
+http.HandleFunc("/pricing", func(w http.ResponseWriter, req *http.Request) {
+	ctx, cancel := context.WithTimeout(req.Context(), 500*time.Millisecond) // never hold the page for it
+	defer cancel()
+	b, err := dr.BotCheck(ctx, devicerisk.BotCheckRequestFrom(req, clientIP(req)))
+	if err == nil && b.Bot.Result != "not_detected" {
+		log.Printf("bot %s %s/%s identity=%s suggestion=%s rule=%s",
+			b.Bot.Category, b.Bot.Provider, b.Bot.Name, b.Bot.Identity, b.Suggestion, b.Bot.Rule)
+	}
+	// ... serve the page
+})
+```
+
+- `clientIP` is yours: the visitor's address as your proxy or load balancer reports it (empty:
+  `req.RemoteAddr`).
+- `Bot`: `Result` (detected, suspected, not_detected), `Category` (`ai_agent`, `ai_assistant`,
+  `ai_crawler`, `ai_search`, `search_crawler`, `link_preview`, `seo`, `monitoring`, `archiver`,
+  `feed_reader`, `security_scanner`, `http_client`, `headless_browser`, `automation`), `Provider` and
+  `Name` (OpenAI, ChatGPT-User), `VerifiedBy`, `Confidence`, `Rule` and `Reasons` (`Code`, `Text`: a
+  sentence for your fraud team).
+- `Bot.Identity`: `verified` (its operator's signature, published addresses or reverse DNS proved it),
+  `unverified` (**a spoofed name**: its operator publishes a way to check, and the check failed) or
+  `claimed` (no way to check it, or not right now).
+- `Network`: `ASN`, `ASNOrg`, `CountryCode`, `Hosting`; nil when Touchque cannot tell.
+- `Suggestion` is **advice in shadow: Touchque never enforces it**. `allow` (a verified bot, a declared
+  crawler, assistant or other bot that cannot be checked, or no bot), `block` (a spoofed name), `challenge`
+  (an AI agent that only names itself, since it acts for a person; undeclared automation; or a suspected bot).
+- Authorization, Cookie, Proxy-Authorization, X-Api-Key and Set-Cookie go with empty values, the URL
+  without its query string, and a request with no headers as `[]`.
+- What the visitor sent never makes it fail: the first 100 headers go, a name is cut to 128 characters
+  and a value to 4096, the body is kept under 32 KB, and the request tells Touchque it was cut
+  (`truncated`). A header HTTP does not allow, a method other than 1 to 16 letters or a URL Touchque
+  could not read is left out. Only no IP (or one that is not an address) is a `*ConfigError`, before
+  anything is sent.
+- Go's `net/http` does not keep the order headers arrived in, so `BotCheckRequestFrom` sends them as a
+  set (`HeaderOrderUnknown`). When your edge gives you the order, build `Headers` yourself in that order.
+- `HTTPVersion` and `TLS` go only when you set them from what your edge saw. `BotCheckRequestFrom`
+  never sets them: `r.Proto` is the connection to your server, which behind a proxy is the proxy's.
+- New categories and fields may be added: they come through as strings, and `Raw` keeps the whole answer.
+
 ## Webhooks
 
 Verify Touchque webhooks with the main Touchque SDK, then compare `event` with
@@ -135,7 +226,8 @@ Verify Touchque webhooks with the main Touchque SDK, then compare `event` with
 go test ./...
 ```
 
-The tests run against the shared fake Touchque API (`testing/fake-touchque-api.mjs`, Node.js).
+The tests run against the shared fake Touchque API (`testing/fake-touchque-api.mjs`, Node.js); the bot
+check tests and the network-kind answer tests use a local `httptest` server.
 
 ## License
 

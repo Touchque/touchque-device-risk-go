@@ -26,6 +26,12 @@
 // verdict (Report missing, unknown, expired; the signal
 // device_identification_missing), never an error: a page without the tag, or
 // with it blocked, only gets the visitor a step-up.
+//
+// For the visitors that never run your page (ChatGPT-User, GPTBot, crawlers,
+// curl, scripts), BotCheck tells from one request's IP and headers which bot
+// sent it and whether that name is proven, with a suggestion in shadow:
+//
+//	b, err := dr.BotCheck(ctx, devicerisk.BotCheckRequestFrom(req, ip))
 package devicerisk
 
 import (
@@ -91,6 +97,14 @@ var Reports = []string{"ok", "replayed", "missing", "unknown", "expired", "inval
 // or new.
 var MatchedBy = []string{"key", "fpc", "sid", "traits", "new"}
 
+// NetworkKinds are the kinds of network an address is on: the network's
+// "kind" in Check, GetEvent and SearchEvents answers, and
+// SearchOptions.NetworkKind. A VPN, hosting, a proxy company, Tor and a
+// relay always win over a place. An open list: new values may be added in
+// minor versions and come through as they came, so keep a default branch.
+// Absent from older servers' answers.
+var NetworkKinds = []string{"residential", "mobile_carrier", "education", "business", "public_wifi", "hosting", "proxy", "vpn", "tor", "relay", "unknown"}
+
 // ActivityTypes are what your server saw the visitor do (ActivityOptions.Type).
 var ActivityTypes = []string{"payment_attempt", "login_failed", "not_found", "forbidden", "otp_sent", "code_failed"}
 
@@ -143,9 +157,13 @@ type Signal struct {
 	// device_identification_missing (no identification, or one that does not verify),
 	// device_pointer_synthetic (the pointer or a finger moved like software),
 	// device_new_storage_burst and device_network_signup_burst (many new browsers,
-	// or sign-ups, in a day from phones like this one on this network),
+	// or sign-ups, in a day on this network from devices like this one: phones,
+	// or identical computers where look-alikes are not joined),
 	// device_input_synthetic (typed or clicked like software) and
-	// device_ai_agent (an AI agent or bot by its own signature or user agent);
+	// device_ai_agent (an AI agent or bot by its own signature or user agent,
+	// or, on servers since 2026-11-25, an AI agent's marks on the page it
+	// drives: the Claude app's browser or Claude in Chrome, Perplexity Comet,
+	// Genspark, Browser Use, Stagehand, Skyvern);
 	// these two ask for a number-matched step-up only, never a block. The
 	// abuse codes of Activity (ActivitySignals) are carried for 24 hours too.
 	// New codes are added in minor versions.
@@ -210,31 +228,65 @@ type CheckResult struct {
 	// VisitorID (tqv_…) is this browser in your workspace only.
 	VisitorID  string
 	Confidence float64
-	// Visitor holds firstSeenAt, lastSeenAt, seenCount, matchedBy, sealed, status (your admin's mark), labels.
+	// Visitor holds firstSeenAt, lastSeenAt, seenCount, matchedBy, sealed,
+	// status (your admin's mark), labels and mark: the mark actually applied
+	// to this identification, "step_up" always, "trusted" only when the
+	// browser matched by its stored key or id (never by traits), else nil (any
+	// other value reads as nil). Older servers send no mark.
 	Visitor map[string]interface{}
 	Counts  map[string]interface{}
-	// Network is the address as the risk engine saw it (never coordinates):
-	// countryCode, region, city, accuracyKm, timeZone, asn, asnOrg, type
-	// (isp, hosting, tor, unknown), tor, hosting, hostingProvider, timezoneMismatch.
+	// Network is the address as the risk engine saw it (never coordinates),
+	// as the API sent it: countryCode, region, city, accuracyKm, timeZone,
+	// asn, asnOrg, type (isp, hosting, tor, relay: Apple's iCloud Private
+	// Relay, never a VPN or hosting; or unknown), tor, hosting,
+	// hostingProvider, proxy (reported as a proxy in the last 30 days:
+	// context; absent on older servers; the proxy list includes IP2Proxy
+	// LITE data available from https://lite.ip2location.com),
+	// timezoneMismatch. Newer servers also send the kind of network
+	// (absent on older ones): kind (NetworkKinds, an open list: new values may
+	// be added in minor versions), kindSource (address, network, mixed,
+	// network_open or name), vpn (a VPN company's own address), shared (10 or
+	// more browsers, or 5 or more accounts from 3 or more browsers, used the
+	// identification's own address on your pages in 24 hours: context only),
+	// sharedVisitors24h and sharedAccounts24h ("at least" counts: 1, 2, 5,
+	// 10, 100 or 1000, as float64 like every JSON number) and
+	// lookAlikeMatching (false: this computer was recognised only by its own
+	// key, cookie or stored id, never because it looks like another one;
+	// true: look-alike matching was allowed). Each is nil when not known:
+	// kind, kindSource and vpn for an identification from before them; the
+	// shared fields and lookAlikeMatching when not counted, or when ClientIP
+	// was another address than the one the browser identified from
+	// (sharedAccounts24h also with no account; lookAlikeMatching also when
+	// not decided: phones, tablets and Safari).
 	Network map[string]interface{}
 	// Velocity holds the visitor's counts: accounts24h, accounts30d,
 	// signUps24h, countries24h, idResets7d, identifications1h, identifications24h.
 	Velocity map[string]interface{}
 	// Bot is one answer to "a bot?": result (detected, suspected,
-	// not_detected) and reasons (detected ones first, then suspected:
-	// webdriver, headless, pointer_synthetic, zero_window, soft_gpu,
-	// tool_<name>, agent_verified, input_synthetic, agent_pace, cdp,
-	// agent_unverified, agent_claimed). Servers since 2026-11-24 also send
-	// (absent on older ones): type (ai_agent: an AI agent or bot by its own
-	// identity, or a pause before every step; automation: a driven browser;
-	// script: moved or typed like software in a browser that shows no
-	// driver; or nil), tools (automation tools whose marks were on the page:
-	// selenium, playwright, puppeteer, phantomjs, nightmare, headless_chrome),
-	// agent (nil, or provider, name, category ai_agent | ai_crawler |
-	// search_crawler, identity verified | unverified | claimed: a Web Bot
-	// Auth signature checked against the provider's published keys, or the
-	// user agent only) and input (insert_no_keys, uniform_keys,
-	// instant_keys, center_press, agent_pace).
+	// not_detected) and reasons, the detected ones first (webdriver,
+	// headless, tool_<name> for each of tools, agent_verified), then the
+	// suspected ones (pointer_synthetic, input_synthetic, agent_pace,
+	// zero_window, headless_window, emulator, cdp: the DevTools protocol
+	// attached, cdp_input: a press with no pressure, input_no_focus: a click
+	// or key into a page that was not in front, insert_text_bulk: text with
+	// no key pressed, scripted_click: a form sent with no click or key,
+	// agent_unverified, agent_claimed), and soft_gpu next to another reason.
+	// New reasons may be added in minor versions. Servers since 2026-11-24
+	// also send (absent on older ones): type (ai_agent: an AI agent or bot by
+	// its own identity or its marks on the page, or a pause before every
+	// step; automation: a driven browser; script: moved or typed like
+	// software in a browser that shows no driver; or nil), tools (whose
+	// marks were on the page: the automation tools selenium, playwright,
+	// puppeteer, phantomjs, nightmare and headless_chrome, and the AI agents
+	// claude_agent (the Claude app's browser or Claude in Chrome),
+	// comet_agent (Perplexity Comet), genspark_agent, browser_use, stagehand
+	// and skyvern), agent (nil, or provider, name, category ai_agent |
+	// ai_crawler | search_crawler, identity verified | unverified | claimed:
+	// a Web Bot Auth signature checked against the provider's published
+	// keys, or the user agent only) and input (insert_no_keys, uniform_keys,
+	// instant_keys, center_press, agent_pace). The AI agents' tools and the
+	// reasons cdp_input, input_no_focus, insert_text_bulk and scripted_click
+	// come from servers since 2026-11-25.
 	Bot map[string]interface{}
 	// AccountDevice: did this account use the device before? nil before an account is named.
 	AccountDevice *AccountDevice
@@ -335,6 +387,25 @@ func wholeNumber(v interface{}) (int, bool) {
 	return int(f), true
 }
 
+// visitorOf is the visitor as it came; a mark other than trusted or step_up
+// reads as nil (no mark applied). The answer's own map is never changed.
+func visitorOf(raw interface{}) map[string]interface{} {
+	v, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	mark, has := v["mark"]
+	if !has || mark == nil || mark == "trusted" || mark == "step_up" {
+		return v
+	}
+	out := make(map[string]interface{}, len(v))
+	for k, x := range v {
+		out[k] = x
+	}
+	out["mark"] = nil
+	return out
+}
+
 // ParseCheck reads an answer, failing toward asking: StepUp is true unless
 // it says exactly false; junk signals are dropped.
 func ParseCheck(res map[string]interface{}) *CheckResult {
@@ -348,7 +419,7 @@ func ParseCheck(res map[string]interface{}) *CheckResult {
 	out.RequestID, _ = res["requestId"].(string)
 	out.VisitorID, _ = res["visitorId"].(string)
 	out.Confidence, _ = res["confidence"].(float64)
-	out.Visitor, _ = res["visitor"].(map[string]interface{})
+	out.Visitor = visitorOf(res["visitor"])
 	out.Counts, _ = res["counts"].(map[string]interface{})
 	out.Network, _ = res["network"].(map[string]interface{})
 	out.Velocity, _ = res["velocity"].(map[string]interface{})
@@ -432,16 +503,29 @@ func (c *Client) Check(ctx context.Context, opts CheckOptions) (*CheckResult, er
 // ISO times (7 days before To by default, at most 90 days, within your
 // retention). IP is an address or a CIDR range and is never returned. StepUp
 // filters only when set. Cursor is the previous page's NextCursor, as it
-// came. Limit is 1 to 100 (0: the default 25).
+// came. Limit is 1 to 100 (0: the default 25). Servers from before network
+// kind ignore NetworkKind and Shared: the search is then not narrowed by them.
 type SearchOptions struct {
 	From, To, Signal, Kind, Origin, IP, Account, VisitorID, RequestID, Cursor string
 	StepUp                                                                    *bool
 	Limit                                                                     int
+	// NetworkKind is the kind of network (one of NetworkKinds; Kind is the
+	// page), sent as networkKind. It matches only identifications classified
+	// since network kind exists: older ones have no kind. Sent as it is, so a
+	// kind newer than this version works; one the server does not know is a
+	// 400 invalid_network_kind.
+	NetworkKind string
+	// Shared filters only when set, sent as shared=true or shared=false:
+	// true, identifications whose own address was shared (many browsers on
+	// your pages in 24 hours); false, the ones counted and not shared. An
+	// identification that was not counted matches neither.
+	Shared *bool
 }
 
 // SearchResult is one page of SearchEvents: pass NextCursor back as Cursor
 // until it is empty. Each event has no address and no raw trait; read its
-// "suspect" with ParseSuspect and its "matchedBy" against MatchedBy.
+// "suspect" with ParseSuspect, its "matchedBy" against MatchedBy and its
+// "network" as CheckResult.Network describes it.
 type SearchResult struct {
 	Events     []map[string]interface{}
 	NextCursor string
@@ -458,13 +542,17 @@ func (c *Client) SearchEvents(ctx context.Context, opts SearchOptions) (*SearchR
 	}
 	params := map[string]string{}
 	for k, v := range map[string]string{"from": opts.From, "to": opts.To, "signal": opts.Signal, "kind": opts.Kind, "origin": opts.Origin,
-		"ip": opts.IP, "account": opts.Account, "visitorId": opts.VisitorID, "requestId": opts.RequestID, "cursor": opts.Cursor} {
+		"ip": opts.IP, "account": opts.Account, "visitorId": opts.VisitorID, "requestId": opts.RequestID, "networkKind": opts.NetworkKind,
+		"cursor": opts.Cursor} {
 		if v != "" {
 			params[k] = v
 		}
 	}
 	if opts.StepUp != nil {
 		params["stepUp"] = strconv.FormatBool(*opts.StepUp)
+	}
+	if opts.Shared != nil {
+		params["shared"] = strconv.FormatBool(*opts.Shared)
 	}
 	if opts.Limit != 0 {
 		params["limit"] = strconv.Itoa(opts.Limit)
@@ -488,7 +576,8 @@ func (c *Client) SearchEvents(ctx context.Context, opts SearchOptions) (*SearchR
 }
 
 // GetEvent reads the trusted identification behind a requestId: the visitor
-// (visitorId, confidence, matchedBy), what the page showed (facts), the risk
+// (visitorId, confidence, matchedBy, mark: the mark actually applied, see
+// CheckResult.Visitor), what the page showed (facts), the risk
 // engine's verdict, accountDevice and suspect (read them with
 // ParseAccountDevice and ParseSuspect). Read-only.
 func (c *Client) GetEvent(ctx context.Context, requestID string) (map[string]interface{}, error) {
